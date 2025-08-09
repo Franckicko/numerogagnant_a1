@@ -1,0 +1,25 @@
+data:
+  courses_csv: data/raw/Courses_Completes.csv
+  hippodromes_csv: data/raw/hippodrome.csv
+  csv_sep: ","
+
+columns:
+  race_id_fields: ["date","hippodrome","numcourse"]
+  target: "a1"
+  drop_cols_regex: "^(a1_|pred\\d+_a1|rapport|r_b1)$"
+  categorical: ["discipline","hippodrome","numcourse"]
+  date: "date"
+
+training:
+  xgb_params:
+    n_estimators: 300
+    max_depth: 4
+    learning_rate: 0.04
+    subsample: 0.7
+    colsample_bytree: 0.7
+    min_child_weight: 4
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    objective: "multi:softprob"
+    eval_metric: "mlogloss"
+

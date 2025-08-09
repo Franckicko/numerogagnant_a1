@@ -1,0 +1,13 @@
+# Env & caches
+.venv/
+__pycache__/
+*.pyc
+
+# Backups & temporaires
+data/raw/*backup*.csv
+*backup*.csv
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
