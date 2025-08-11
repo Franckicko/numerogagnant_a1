@@ -1,13 +1,6 @@
-# Env & caches
-.venv/
 __pycache__/
 *.pyc
-
-# Backups & temporaires
-data/raw/*backup*.csv
-*backup*.csv
+*.pyo
+*.pyd
 *.log
-
-# OS
-.DS_Store
-Thumbs.db
+.streamlit/secrets.toml
