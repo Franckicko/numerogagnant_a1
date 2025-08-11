@@ -1,6 +1,5 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.log
+.ipynb_checkpoints/
+.DS_Store
 .streamlit/secrets.toml
