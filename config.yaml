@@ -1,25 +1,33 @@
 data:
-  courses_csv: data/raw/Courses_Completes.csv
+  courses_csv: data/raw/Courses_Completes_a2.csv
   hippodromes_csv: data/raw/hippodrome.csv
-  csv_sep: ","
-
+  csv_sep: ','
 columns:
-  race_id_fields: ["date","hippodrome","numcourse"]
-  target: "a1"
-  drop_cols_regex: "^(a1_|pred\\d+_a1|rapport|r_b1)$"
-  categorical: ["discipline","hippodrome","numcourse"]
-  date: "date"
-
+  race_id_fields:
+  - date
+  - hippodrome
+  - numcourse
+  target: a2
+  drop_cols_regex: ^(rapport|r_b\d+|si_a\d+_dans_pronos|pred\d+_a\d+|a\d+_.*)$
+  categorical:
+  - discipline
+  - hippodrome
+  - numcourse
+  date: date
 training:
   xgb_params:
-    n_estimators: 300
-    max_depth: 4
-    learning_rate: 0.04
-    subsample: 0.7
-    colsample_bytree: 0.7
-    min_child_weight: 4
-    reg_alpha: 0.1
-    reg_lambda: 1.0
-    objective: "multi:softprob"
-    eval_metric: "mlogloss"
-
+    n_estimators: 2000
+    learning_rate: 0.03645714663913172
+    max_depth: 5
+    min_child_weight: 10
+    subsample: 0.7317707183164001
+    colsample_bytree: 0.6252976503454564
+    gamma: 0.23609978448167926
+    reg_alpha: 0.6940323536236179
+    reg_lambda: 2.1361586239777823
+    objective: multi:softprob
+    eval_metric: mlogloss
+    tree_method: hist
+    num_class: 18
+  test_size: 0.2
+  random_state: 42

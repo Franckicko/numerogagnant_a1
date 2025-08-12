@@ -1,0 +1,20 @@
+xgb_params:
+  n_estimators: 2000
+  learning_rate: 0.03645714663913172
+  max_depth: 5
+  min_child_weight: 10
+  subsample: 0.7317707183164001
+  colsample_bytree: 0.6252976503454564
+  gamma: 0.23609978448167926
+  reg_alpha: 0.6940323536236179
+  reg_lambda: 2.1361586239777823
+  objective: multi:softprob
+  eval_metric: mlogloss
+  tree_method: hist
+  num_class: 18
+optimize_for: logloss
+best_value: 2.821600587874917
+mean_logloss: 2.821600587874917
+mean_hit4: 0.256083541748936
+trials: 50
+cv: 5
