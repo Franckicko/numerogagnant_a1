@@ -1,0 +1,29 @@
+app: a1
+target_col: a1
+date_col: date
+id_cols: [race_id, hippodrome, numcourse]
+prono_cols: [prono1, prono2, prono3, prono4, prono5, prono6, prono7, prono8]
+num_features: [partants, distance]
+cat_features: [discipline, hippodrome]
+model:
+  type: xgboost    # 'xgboost' or 'hgb' (sklearn HistGradientBoosting) fallback
+  params:
+    n_estimators: 600
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    objective: multi:softprob
+    reg_lambda: 1.0
+    min_child_weight: 1.0
+    random_state: 42
+training:
+  valid_ratio: 0.2          # split temporel (tail)
+  epsilon_promotion: 1e-4   # seuil anti-bruit pour promouvoir un champion
+  min_train_rows: 5000
+
+training:
+  min_valid: 200           # au lieu de 300
+  valid_ratio: 0.20        # inchangé
+  early_stopping_rounds: 80
+  epsilon_promotion: 1e-4
