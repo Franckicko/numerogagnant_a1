@@ -6,6 +6,28 @@ import joblib, yaml
 from datetime import date
 
 # --- Compatibilité anciens modèles : wrapper PreprocBooster
+class PreprocBooster:
+    def __init__(self, pre=None, clf=None, pipe=None, model=None):
+        # selon la version sauvegardée, le pickled state peut contenir pipe OU (pre, clf) OU model
+        self.pre = pre
+        self.clf = clf
+        self.pipe = pipe
+        self.model = model
+
+    def predict_proba(self, X):
+        # 1) Pipeline sklearn complet
+        if self.pipe is not None and hasattr(self.pipe, "predict_proba"):
+            return self.pipe.predict_proba(X)
+        # 2) Objet 'model' stocké directement
+        if self.model is not None and hasattr(self.model, "predict_proba"):
+            return self.model.predict_proba(X)
+        # 3) Préprocesseur + modèle séparés
+        if self.pre is not None and self.clf is not None:
+            Xt = self.pre.transform(X)
+            return self.clf.predict_proba(Xt)
+        raise AttributeError("PreprocBooster: composants manquants (pipe/model ou pre+clf).")
+
+# --- Compatibilité anciens modèles : wrapper PreprocBooster
 # Certains modèles ont été picklés avec une classe PreprocBooster déclarée en __main__.
 # On redéclare ici un wrapper minimal qui sait prédire dans tous les cas.
 class PreprocBooster:
