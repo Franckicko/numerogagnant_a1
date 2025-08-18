@@ -1,3 +1,17 @@
+import streamlit as st
+st.set_page_config(page_title="Numero Gagnant – A1", layout="wide")
+st.write("🚀 App boot…")
+
+try:
+    # (laisse le reste de tes imports et de ton code en-dessous)
+    pass
+except Exception as e:
+    import traceback
+    st.error("❌ Erreur au démarrage de l’app")
+    st.code(traceback.format_exc())
+import sklearn, numpy as _np, pandas as _pd
+st.caption(f"sklearn {_pytest:=sklearn.__version__} | numpy {_np.__version__} | pandas {_pd.__version__}")
+
 # repack_model.py — reconditionne le modèle en Pipeline propre
 from pathlib import Path
 import shutil, joblib
