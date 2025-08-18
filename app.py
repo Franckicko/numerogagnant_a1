@@ -27,11 +27,41 @@ MODEL_PATH = ROOT / "models" / "xgb_multiclass.joblib"
 from src.features import build_feature_frame
 from src.metrics import logloss_top4_renorm, hit_at_k
 
-# --- Shim éventuel pour d'anciens pickles -----------------------------------
-# (laisse cette classe vide : elle sert juste à dépickler si le joblib référence ce nom)
-class PreprocBooster:  # noqa: N801
-    pass
+# --- Shim pour ceux des modèles picklés avec un wrapper "PreprocBooster"
+# Il reconstruit un vrai Pipeline et expose predict_proba(X)
+from sklearn.pipeline import Pipeline
 
+class PreprocBooster:
+    def __init__(self, pre=None, clf=None, pipe=None, model=None):
+        self.pre = pre
+        self.clf = clf
+        self.pipe = pipe
+        self.model = model
+        self._cached = None  # pipeline reconstruit / modèle utilisable
+
+    def _as_estimator(self):
+        if self._cached is not None:
+            return self._cached
+        # 1) déjà un pipeline complet
+        if self.pipe is not None:
+            self._cached = self.pipe
+        # 2) un modèle final prêt
+        elif self.model is not None:
+            self._cached = self.model
+        # 3) préprocesseur + classifieur => Pipeline(pre, clf)
+        elif (self.pre is not None) and (self.clf is not None):
+            self._cached = Pipeline([("pre", self.pre), ("clf", self.clf)])
+        else:
+            # dernier recours: l’objet lui-même (laisser lever si pas d’API)
+            self._cached = self
+        return self._cached
+
+    # API attendue par l’app
+    def predict_proba(self, X):
+        est = self._as_estimator()
+        if hasattr(est, "predict_proba"):
+            return est.predict_proba(X)
+        raise AttributeError("PreprocBooster shim: aucun 'predict_proba' disponible")
 
 # =============================================================================
 #                               UTILITAIRES
@@ -56,16 +86,20 @@ def ensure_files() -> Path:
 
 
 def load_model_and_cfg():
-    """Charge le modèle (Pipeline) + classes + config YAML."""
     blob = joblib.load(MODEL_PATH)
-    if isinstance(blob, dict) and "model" in blob:
-        model = blob["model"]
+    # Le modèle sauvé peut être {"model": obj, "classes": [...] } ou directement l'objet
+    if isinstance(blob, dict):
+        model = blob.get("model")
         classes = blob.get("classes")
     else:
         model = blob
         classes = None
+
+    # Si c’est un PreprocBooster (shim), on garde : il expose predict_proba()
+    # Sinon, on le laisse tel quel (Pipeline, XGBClassifier, …)
     cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-    return model, classes, cfg
+    num_classes = int(max(classes)) if classes is not None else None
+    return model, num_classes, cfg
 
 
 def append_or_update_row(row: dict) -> pd.DataFrame:
@@ -288,42 +322,77 @@ try:
             )
 
     # ---- Nouvelle course
-    with tabs[1]:
-        st.subheader("Renseigner la course & lancer la prédiction Top-4")
-        col1, col2, col3 = st.columns(3)
-        dte = col1.date_input("Date", value=date.today(), key="new_date")
-        hip = col2.text_input("Hippodrome", value="Deauville", key="new_hip")
-        nc = col3.text_input("Numcourse", value="C3", key="new_nc")
-        col4, col5, col6 = st.columns(3)
-        part = col4.number_input("Partants", min_value=2, max_value=24, value=16, step=1, key="new_part")
-        dist = col5.number_input("Distance (m)", min_value=400, max_value=5000, value=2000, step=50, key="new_dist")
-        disc = col6.selectbox("Discipline", options=["galop", "trot"], index=0, key="new_disc")
-        pronos = st.text_input("Pronos (8 numéros séparés par des virgules)", value="9,13,15,12,16,1,6,2", key="new_pronos")
+with tabs[1]:
+    st.subheader("Renseigner la course & lancer la prédiction Top-4")
 
-        if st.button("🔮 Prédire Top-4", key="btn_predict"):
-            args = {
-                "date": dte.isoformat(),
-                "hippodrome": hip.strip(),
-                "numcourse": nc.strip(),
-                "partants": int(part),
-                "distance": float(dist),
-                "discipline": disc,
-                "pronos": pronos,
-            }
-            out, top_nums, top_probs = predict_top4(args)
-            row = {"race_id": out["race_id"], **out, "true_a1": np.nan}
-            dfp = append_or_update_row(row)
-            st.success(f"Top-4 pour {out['race_id']}")
-            st.dataframe(
-                pd.DataFrame(
-                    {
-                        "rang": [1, 2, 3, 4],
-                        "numero": [out["pred1_a1"], out["pred2_a1"], out["pred3_a1"], out["pred4_a1"]],
-                        "proba": [out["proba1"], out["proba2"], out["proba3"], out["proba4"]],
-                    }
-                ),
-                use_container_width=True,
-            )
+    # Essaye de proposer une liste d'hippodromes depuis un fichier si présent
+    hippo_choices = None
+    hippo_csv = ROOT / "data" / "raw" / "hippodrome.csv"
+    if hippo_csv.exists():
+        try:
+            hippo_df = pd.read_csv(hippo_csv)
+            # suppose une colonne "hippodrome"
+            if "hippodrome" in hippo_df.columns:
+                hippo_choices = sorted(x for x in hippo_df["hippodrome"].dropna().unique())
+        except Exception:
+            hippo_choices = None
+
+    col1, col2, col3 = st.columns(3)
+    dte = col1.date_input("Date", value=date.today(), key="new_dte")
+
+    if hippo_choices:
+        hip = col2.selectbox("Hippodrome", hippo_choices, index=0, key="new_hip")
+    else:
+        hip = col2.text_input("Hippodrome", value="Deauville", key="new_hip_txt")
+
+    nc = col3.selectbox("Numcourse", [f"C{i}" for i in range(1, 11)], index=2, key="new_nc")
+
+    col4, col5, col6 = st.columns(3)
+    part = col4.number_input("Partants", min_value=2, max_value=24, value=16, step=1, key="new_part")
+    dist = col5.number_input("Distance (m)", min_value=400, max_value=5000, value=2000, step=50, key="new_dist")
+    disc = col6.selectbox("Discipline", options=["galop", "trot"], index=0, key="new_disc")
+
+    st.markdown("**Pronos (8 numéros)**")
+    pc1, pc2, pc3, pc4, pc5, pc6, pc7, pc8 = st.columns(8)
+    p1 = pc1.number_input("1", 1, 24, 9, key="p1")
+    p2 = pc2.number_input("2", 1, 24, 13, key="p2")
+    p3 = pc3.number_input("3", 1, 24, 15, key="p3")
+    p4 = pc4.number_input("4", 1, 24, 12, key="p4")
+    p5 = pc5.number_input("5", 1, 24, 16, key="p5")
+    p6 = pc6.number_input("6", 1, 24, 1, key="p6")
+    p7 = pc7.number_input("7", 1, 24, 6, key="p7")
+    p8 = pc8.number_input("8", 1, 24, 2, key="p8")
+    pronos = ",".join(str(x) for x in [p1, p2, p3, p4, p5, p6, p7, p8])
+
+    if st.button("🔮 Prédire Top-4", key="btn_predire"):
+        args = {
+            "date": dte.isoformat(),
+            "hippodrome": hip.strip(),
+            "numcourse": nc.strip(),
+            "partants": int(part),
+            "distance": float(dist),
+            "discipline": disc,
+            "pronos": pronos,
+        }
+        out, top_nums, top_probs = predict_top4(args)
+        # on stocke aussi les métadonnées pour que l'historique/validation soient complets
+        row = {
+            **out,
+            "true_a1": None,
+            "date": dte.isoformat(),
+            "hippodrome": hip.strip(),
+            "numcourse": nc.strip(),
+            "partants": int(part),
+            "distance": float(dist),
+            "discipline": disc,
+        }
+        dfp = append_or_update_row(row)
+        st.success(f"Top-4 pour {out['race_id']}")
+        st.dataframe(pd.DataFrame({
+            "rang": [1,2,3,4],
+            "numero": [out.get("pred1_a1"), out.get("pred2_a1"), out.get("pred3_a1"), out.get("pred4_a1")],
+            "proba": [out.get("proba1"), out.get("proba2"), out.get("proba3"), out.get("proba4")]
+        }))
 
     # ---- Validation
     with tabs[2]:
