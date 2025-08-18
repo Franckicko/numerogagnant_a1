@@ -27,8 +27,9 @@ MODEL_PATH = ROOT / "models" / "xgb_multiclass.joblib"
 from src.features import build_feature_frame
 from src.metrics import logloss_top4_renorm
 
-# --- Shim pour ceux des modèles picklés avec un wrapper "PreprocBooster"
-# Il reconstruit un vrai Pipeline et expose predict_proba(X)
+# --- (facultatif) Wrapper historique vu dans des joblib anciens --------------
+# On le garde pour compat, mais on va de toute façon "déballer" vers un vrai
+# estimateur dans _coerce_to_estimator() juste après.
 from sklearn.pipeline import Pipeline
 class PreprocBooster:
     def __init__(self, pre=None, clf=None, pipe=None, model=None):
@@ -36,27 +37,33 @@ class PreprocBooster:
         self.clf = clf
         self.pipe = pipe
         self.model = model
-        self._cached = None  # pipeline reconstruit / modèle utilisable
 
-    def _as_estimator(self):
-        if self._cached is not None:
-            return self._cached
-        if self.pipe is not None:
-            self._cached = self.pipe
-        elif self.model is not None:
-            self._cached = self.model
-        elif (self.pre is not None) and (self.clf is not None):
-            self._cached = Pipeline([("pre", self.pre), ("clf", self.clf)])
-        else:
-            self._cached = self
-        return self._cached
+# --- Déballage robuste vers un estimateur avec predict_proba -----------------
+def _coerce_to_estimator(m):
+    """Retourne un estimateur qui a predict_proba(X) à partir de m (pipeline,
+    classifieur ou wrapper type PreprocBooster). Lève une erreur claire sinon."""
+    # Déjà utilisable ?
+    if hasattr(m, "predict_proba"):
+        return m
 
-    def predict_proba(self, X):
-        est = self._as_estimator()
+    # Cherche des attributs classiques où se cache l'estimateur
+    for attr in ("pipe", "model", "estimator", "pipeline", "clf_", "clf"):
+        est = getattr(m, attr, None)
+        if est is not None and hasattr(est, "predict_proba"):
+            return est
+
+    # Reconstruit un pipeline à partir de (pre, clf)
+    pre = getattr(m, "pre", None)
+    clf = getattr(m, "clf", None)
+    if pre is not None and clf is not None:
+        est = Pipeline([("pre", pre), ("clf", clf)])
         if hasattr(est, "predict_proba"):
-            return est.predict_proba(X)
-        raise AttributeError("PreprocBooster shim: aucun 'predict_proba' disponible")
+            return est
 
+    raise RuntimeError(
+        "Le modèle chargé n'expose pas predict_proba. "
+        "Repackez/sauvegardez le modèle au format {'model': pipeline, 'classes': [...] }."
+    )
 
 # =============================================================================
 #                               UTILITAIRES
@@ -82,15 +89,21 @@ def ensure_files() -> Path:
 
 def load_model_and_cfg():
     blob = joblib.load(MODEL_PATH)
+
     # Le modèle sauvé peut être {"model": obj, "classes": [...] } ou directement l'objet
     if isinstance(blob, dict):
-        model = blob.get("model")
-        classes = blob.get("classes")  # <- on renvoie bien 'classes', pas un nombre
+        raw_model = blob.get("model")
+        classes = blob.get("classes")
     else:
-        model = blob
+        raw_model = blob
         classes = None
+
+    # Déballage vers un estimateur qui a predict_proba
+    model = _coerce_to_estimator(raw_model)
+
     cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-    return model, classes, cfg
+    num_classes = int(max(classes)) if classes is not None else None
+    return model, num_classes, cfg
 
 
 def append_or_update_row(row: dict) -> pd.DataFrame:
@@ -99,12 +112,12 @@ def append_or_update_row(row: dict) -> pd.DataFrame:
     df = pd.read_csv(preds_path)
     if not df.empty and "race_id" in df.columns and (df["race_id"] == row["race_id"]).any():
         mask = df["race_id"] == row["race_id"]
-        for k, v in row.items():
-            if k in df.columns:
-                df.loc[mask, k] = v
-            else:
+        # s'assure que toutes colonnes existent
+        for k in row.keys():
+            if k not in df.columns:
                 df[k] = np.nan
-                df.loc[mask, k] = v
+        for k, v in row.items():
+            df.loc[mask, k] = v
     else:
         for k in row.keys():
             if k not in df.columns:
@@ -139,6 +152,7 @@ def predict_top4(args: dict):
     proba_vec = model.predict_proba(X)[0]
     num_classes = int(max(classes)) if classes is not None else len(proba_vec)
 
+    # proba par numéro de nos pronos uniquement, triées décroissantes
     pairs = []
     for numero in pronos:
         p = float(proba_vec[int(numero) - 1]) if 1 <= int(numero) <= num_classes else 0.0
@@ -187,6 +201,7 @@ def update_truth(args: dict):
     proba = model.predict_proba(X)[0]
     num_classes = int(max(classes)) if classes is not None else len(proba)
 
+    # Récupère un Top-4 déjà stocké si présent (sinon à partir du modèle)
     preds_path = ensure_files()
     dfp = pd.read_csv(preds_path)
     race_id = _race_id(args["date"], args["hippodrome"], args["numcourse"])
@@ -204,6 +219,7 @@ def update_truth(args: dict):
         top_nums = [n for n, _ in pairs[:4]]
         top_probs = [p for _, p in pairs[:4]]
 
+    # p_true race-aware (renormalisation sur les K partants)
     denom = float(proba[:K].sum()) if K <= len(proba) else float(proba.sum())
     true_num = int(args["true"])
     p_true_race = (float(proba[true_num - 1]) / denom) if (1 <= true_num <= len(proba) and denom > 0) else (1.0 / max(K, 1))
@@ -275,7 +291,6 @@ def block_two_periods(df: pd.DataFrame, cutoff_str: str):
 # =============================================================================
 #                                   UI
 # =============================================================================
-
 preds_path = ensure_files()
 dfp = pd.read_csv(preds_path)
 dash = compute_dashboard_metrics(dfp)
@@ -307,126 +322,144 @@ with tabs[0]:
                        row.get("pred3_a1"), row.get("pred4_a1")],
             "proba": [row.get("proba1"), row.get("proba2"),
                       row.get("proba3"), row.get("proba4")]
-        }), use_container_width=True)
+        }))
 
 # ---- Nouvelle course
 with tabs[1]:
-    st.subheader("Renseigner la course & lancer la prédiction Top-4")
-    col1, col2, col3 = st.columns(3)
-    dte = col1.date_input("Date", value=date.today(), key="nc_date")
-    hip = col2.text_input("Hippodrome", value="Deauville", key="nc_hip")
-    nc  = col3.selectbox("Numcourse", [f"C{i}" for i in range(1, 11)], index=2, key="nc_course")
+    try:
+        st.subheader("Renseigner la course & lancer la prédiction Top-4")
+        col1, col2, col3 = st.columns(3)
+        dte = col1.date_input("Date", value=date.today(), key="nc_date")
 
-    col4, col5, col6 = st.columns(3)
-    part = col4.number_input("Partants", min_value=2, max_value=24, value=16, step=1, key="nc_partants")
-    dist = col5.number_input("Distance (m)", min_value=400, max_value=5000, value=2000, step=50, key="nc_dist")
-    disc = col6.selectbox("Discipline", options=["galop", "trot"], index=0, key="nc_disc")
+        # Liste d'hippodromes (depuis l'historique si dispo, sinon défauts)
+        HIPPOS = sorted(set(dfp.get("hippodrome", pd.Series(dtype=str)).dropna().astype(str))) if not dfp.empty else []
+        if not HIPPOS:
+            HIPPOS = ["Deauville", "Vincennes", "Chantilly", "Longchamp", "Cagnes-sur-Mer", "Pau", "Lyon-Parilly"]
+        hip = col2.selectbox(
+            "Hippodrome", options=HIPPOS,
+            index=(HIPPOS.index("Deauville") if "Deauville" in HIPPOS else 0),
+            key="nc_hip"
+        )
 
-    st.caption("Pronos (8 numéros)")
-    pc1, pc2, pc3, pc4 = st.columns(4)
-    pd1, pd2, pd3, pd4 = st.columns(4)
-    p1 = pc1.number_input("prono1", 1, 24, 9,  key="p1")
-    p2 = pc2.number_input("prono2", 1, 24, 13, key="p2")
-    p3 = pc3.number_input("prono3", 1, 24, 15, key="p3")
-    p4 = pc4.number_input("prono4", 1, 24, 12, key="p4")
-    p5 = pd1.number_input("prono5", 1, 24, 16, key="p5")
-    p6 = pd2.number_input("prono6", 1, 24, 1,  key="p6")
-    p7 = pd3.number_input("prono7", 1, 24, 6,  key="p7")
-    p8 = pd4.number_input("prono8", 1, 24, 2,  key="p8")
+        nc  = col3.selectbox("Numcourse", [f"C{i}" for i in range(1, 11)], index=2, key="nc_course")
 
-    if st.button("🔮 Prédire Top-4", key="btn_predire_top4"):
-        args = {
-            "date": dte.isoformat(),
-            "hippodrome": hip.strip(),
-            "numcourse": nc.strip(),
-            "partants": int(part),
-            "distance": float(dist),
-            "discipline": disc,
-            "pronos": ",".join(map(str, [p1, p2, p3, p4, p5, p6, p7, p8])),
-        }
-        out, top_nums, top_probs = predict_top4(args)
-        row = {"race_id": out["race_id"], **out, "true_a1": None}
-        dfp = append_or_update_row(row)
-        st.success(f"Top-4 pour {out['race_id']}")
-        st.dataframe(pd.DataFrame({
-            "rang":   [1, 2, 3, 4],
-            "numero": [out['pred1_a1'], out['pred2_a1'], out['pred3_a1'], out['pred4_a1']],
-            "proba":  [out['proba1'],   out['proba2'],   out['proba3'],   out['proba4']],
-        }), use_container_width=True)
+        col4, col5, col6 = st.columns(3)
+        part = col4.number_input("Partants", min_value=2, max_value=24, value=16, step=1, key="nc_partants")
+        dist = col5.number_input("Distance (m)", min_value=400, max_value=5000, value=2000, step=50, key="nc_dist")
+        disc = col6.selectbox("Discipline", options=["galop", "trot"], index=0, key="nc_disc")
+
+        st.caption("Pronos (8 numéros)")
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pd1, pd2, pd3, pd4 = st.columns(4)
+        p1 = pc1.number_input("prono1", 1, 24, 9,  key="p1")
+        p2 = pc2.number_input("prono2", 1, 24, 13, key="p2")
+        p3 = pc3.number_input("prono3", 1, 24, 15, key="p3")
+        p4 = pc4.number_input("prono4", 1, 24, 12, key="p4")
+        p5 = pd1.number_input("prono5", 1, 24, 16, key="p5")
+        p6 = pd2.number_input("prono6", 1, 24, 1,  key="p6")
+        p7 = pd3.number_input("prono7", 1, 24, 6,  key="p7")
+        p8 = pd4.number_input("prono8", 1, 24, 2,  key="p8")
+
+        if st.button("🔮 Prédire Top-4", key="btn_predire_top4"):
+            args = {
+                "date": dte.isoformat(),
+                "hippodrome": str(hip).strip(),
+                "numcourse": str(nc).strip(),
+                "partants": int(part),
+                "distance": float(dist),
+                "discipline": disc,
+                "pronos": ",".join(map(str, [p1, p2, p3, p4, p5, p6, p7, p8])),
+            }
+            out, top_nums, top_probs = predict_top4(args)
+            row = {"race_id": out["race_id"], **out, "true_a1": None}
+            dfp = append_or_update_row(row)
+            st.success(f"Top-4 pour {out['race_id']}")
+            st.dataframe(pd.DataFrame({
+                "rang":   [1, 2, 3, 4],
+                "numero": [out['pred1_a1'], out['pred2_a1'], out['pred3_a1'], out['pred4_a1']],
+                "proba":  [out['proba1'],   out['proba2'],   out['proba3'],   out['proba4']],
+            }))
+    except Exception as e:
+        st.error("Erreur dans 'Nouvelle course'")
+        st.exception(e)
 
 # ---- Validation
 with tabs[2]:
-    st.subheader("Valider l’arrivée (vérité) et mettre à jour les métriques")
-    if dfp.empty:
-        st.info("Aucune course prédite à valider.")
-    else:
-        rid = st.selectbox("Course à valider", options=dfp["race_id"].tolist(), key="val_rid")
-        c1, c2, c3 = st.columns(3)
-        dte2 = c1.text_input("Date (YYYY-MM-DD)", value=rid.split("_", 1)[0], key="val_date")
-        hip2 = c2.text_input("Hippodrome", value=rid.split("_")[1], key="val_hip")
-        nc2  = c3.text_input("Numcourse", value=rid.split("_")[2], key="val_course")
-        c4, c5, c6 = st.columns(3)
-        def _get_partants():
-            try:
-                return int(dfp.loc[dfp["race_id"] == rid, "partants"].iloc[0])
-            except Exception:
-                return 16
-        part2 = c4.number_input("Partants", 2, 24, _get_partants(), 1, key="val_part")
-        dist2 = c5.number_input("Distance (m)", 400, 5000, 2000, 50, key="val_dist")
-        disc2 = c6.selectbox("Discipline", ["galop", "trot"], index=0, key="val_disc")
+    try:
+        st.subheader("Valider l’arrivée (vérité) et mettre à jour les métriques")
+        if dfp.empty:
+            st.info("Aucune course prédite à valider.")
+        else:
+            rid = st.selectbox("Course à valider", options=dfp["race_id"].tolist(), key="val_rid")
+            c1, c2, c3 = st.columns(3)
+            dte2 = c1.text_input("Date (YYYY-MM-DD)", value=rid.split("_", 1)[0], key="val_date")
+            hip2 = c2.text_input("Hippodrome", value=rid.split("_")[1], key="val_hip")
+            nc2  = c3.text_input("Numcourse", value=rid.split("_")[2], key="val_course")
+            c4, c5, c6 = st.columns(3)
+            part2 = c4.number_input("Partants", 2, 24, 16, 1, key="val_part")
+            dist2 = c5.number_input("Distance (m)", 400, 5000, 2000, 50, key="val_dist")
+            disc2 = c6.selectbox("Discipline", ["galop", "trot"], index=0, key="val_disc")
 
-        pr_def = []
-        for i in range(1, 5):
-            v = dfp.loc[dfp["race_id"] == rid, f"pred{i}_a1"]
-            pr_def.append(int(v.iloc[0]) if len(v) and pd.notna(v.iloc[0]) else i)
-        pr_def += [5, 6, 7, 8]
-        c7, c8, c9, c10 = st.columns(4)
-        c11, c12, c13, c14 = st.columns(4)
-        q1 = c7.number_input("prono1", 1, 24, pr_def[0], key="val_p1")
-        q2 = c8.number_input("prono2", 1, 24, pr_def[1], key="val_p2")
-        q3 = c9.number_input("prono3", 1, 24, pr_def[2], key="val_p3")
-        q4 = c10.number_input("prono4", 1, 24, pr_def[3], key="val_p4")
-        q5 = c11.number_input("prono5", 1, 24, pr_def[4], key="val_p5")
-        q6 = c12.number_input("prono6", 1, 24, pr_def[5], key="val_p6")
-        q7 = c13.number_input("prono7", 1, 24, pr_def[6], key="val_p7")
-        q8 = c14.number_input("prono8", 1, 24, pr_def[7], key="val_p8")
+            # on re-propose les 8 pronos (par défaut : ceux du Top-4 si dispo)
+            pr_def = []
+            for i in range(1, 5):
+                v = dfp.loc[dfp["race_id"] == rid, f"pred{i}_a1"]
+                pr_def.append(int(v.iloc[0]) if len(v) and pd.notna(v.iloc[0]) else i)
+            pr_def += [5, 6, 7, 8]
+            c7, c8, c9, c10 = st.columns(4)
+            c11, c12, c13, c14 = st.columns(4)
+            q1 = c7.number_input("prono1", 1, 24, pr_def[0], key="val_p1")
+            q2 = c8.number_input("prono2", 1, 24, pr_def[1], key="val_p2")
+            q3 = c9.number_input("prono3", 1, 24, pr_def[2], key="val_p3")
+            q4 = c10.number_input("prono4", 1, 24, pr_def[3], key="val_p4")
+            q5 = c11.number_input("prono5", 1, 24, pr_def[4], key="val_p5")
+            q6 = c12.number_input("prono6", 1, 24, pr_def[5], key="val_p6")
+            q7 = c13.number_input("prono7", 1, 24, pr_def[6], key="val_p7")
+            q8 = c14.number_input("prono8", 1, 24, pr_def[7], key="val_p8")
 
-        true_num = st.number_input("Numéro gagnant (a1)", 1, 24, 6, 1, key="val_true")
-        if st.button("💾 Valider", key="btn_valider"):
-            args = {
-                "date": dte2, "hippodrome": hip2, "numcourse": nc2,
-                "true": int(true_num),
-                "pronos": ",".join(map(str, [q1, q2, q3, q4, q5, q6, q7, q8])),
-                "partants": int(part2), "distance": float(dist2), "discipline": disc2,
-            }
-            upd = update_truth(args)
-            dfp = append_or_update_row(upd)
-            st.success(
-                f"Mise à jour OK — H@4={upd['hit4']}  |  "
-                f"ll_race={upd['logloss_item_raceaware']:.4f}  |  "
-                f"ll_top4={upd['logloss_item_top4']:.4f}"
-            )
+            true_num = st.number_input("Numéro gagnant (a1)", 1, 24, 6, 1, key="val_true")
+            if st.button("💾 Valider", key="btn_valider"):
+                args = {
+                    "date": dte2, "hippodrome": hip2, "numcourse": nc2,
+                    "true": int(true_num),
+                    "pronos": ",".join(map(str, [q1, q2, q3, q4, q5, q6, q7, q8])),
+                    "partants": int(part2), "distance": float(dist2), "discipline": disc2,
+                }
+                upd = update_truth(args)
+                dfp = append_or_update_row(upd)
+                st.success(
+                    f"Mise à jour OK — H@4={upd['hit4']}  |  "
+                    f"ll_race={upd['logloss_item_raceaware']:.4f}  |  "
+                    f"ll_top4={upd['logloss_item_top4']:.4f}"
+                )
+    except Exception as e:
+        st.error("Erreur dans 'Validation'")
+        st.exception(e)
 
 # ---- 2 périodes
 with tabs[3]:
-    st.subheader("Comparer 2 périodes (fixe vs dynamique)")
-    cutoff = st.date_input("Date de coupure", value=date.today(), key="cutoff")
-    b1, b2 = block_two_periods(dfp, cutoff.isoformat())
+    try:
+        st.subheader("Comparer 2 périodes (fixe vs dynamique)")
+        cutoff = st.date_input("Date de coupure", value=date.today(), key="cutoff")
+        b1, b2 = block_two_periods(dfp, cutoff.isoformat())
 
-    def fmt_pct(x): return "—" if (x is None or pd.isna(x)) else f"{100*x:0.2f}%"
-    def fmt_ll(x):  return "—" if (x is None or pd.isna(x)) else f"{x:0.4f}"
+        def fmt_pct(x): return "—" if (x is None or np.isnan(x)) else f"{100*x:0.2f}%"
+        def fmt_ll(x):  return "—" if (x is None or np.isnan(x)) else f"{x:0.4f}"
 
-    colA, colB = st.columns(2)
-    if b1 is None:
-        st.info("Aucune course validée.")
-    else:
-        with colA:
-            st.markdown(f"### ≤ {cutoff.isoformat()}  (N={b1['n']})")
-            st.write(f"Hit@4 : {fmt_pct(b1['hit4'])}")
-            st.write(f"Vrai LogLoss : {fmt_ll(b1['ll_race'])}")
-            st.write(f"Faux LogLoss Top-4 : {fmt_ll(b1['ll_top4'])}")
-        with colB:
-            st.markdown(f"### > {cutoff.isoformat()}  (N={b2['n']})")
-            st.write(f"Hit@4 : {fmt_pct(b2['hit4'])}")
-            st.write(f"Vrai LogLoss : {fmt_ll(b2['ll_race'])}")
-            st.write(f"Faux LogLoss Top-4 : {fmt_ll(b2['ll_top4'])}")
+        colA, colB = st.columns(2)
+        if b1 is None:
+            st.info("Aucune course validée.")
+        else:
+            with colA:
+                st.markdown(f"### ≤ {cutoff.isoformat()}  (N={b1['n']})")
+                st.write(f"Hit@4 : {fmt_pct(b1['hit4'])}")
+                st.write(f"Vrai LogLoss : {fmt_ll(b1['ll_race'])}")
+                st.write(f"Faux LogLoss Top-4 : {fmt_ll(b1['ll_top4'])}")
+            with colB:
+                st.markdown(f"### > {cutoff.isoformat()}  (N={b2['n']})")
+                st.write(f"Hit@4 : {fmt_pct(b2['hit4'])}")
+                st.write(f"Vrai LogLoss : {fmt_ll(b2['ll_race'])}")
+                st.write(f"Faux LogLoss Top-4 : {fmt_ll(b2['ll_top4'])}")
+    except Exception as e:
+        st.error("Erreur dans '2 périodes'")
+        st.exception(e)
