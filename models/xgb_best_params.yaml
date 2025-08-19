@@ -12,9 +12,4 @@ xgb_params:
   eval_metric: mlogloss
   tree_method: hist
   num_class: 18
-optimize_for: logloss
-best_value: 2.821600587874917
-mean_logloss: 2.821600587874917
-mean_hit4: 0.256083541748936
-trials: 50
-cv: 5
+temperature_T: 1.4377312734760093

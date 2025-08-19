@@ -1,5 +1,29 @@
-﻿__pycache__/
+﻿# Python
+__pycache__/
 *.pyc
-.ipynb_checkpoints/
-.DS_Store
-.streamlit/secrets.toml
+
+# IDE / env
+.venv/
+.env
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
+
+# Data générées / temporaires
+data/processed/
+data/raw/pending_courses.csv
+data/raw/ui_draft.json
+data/raw/*backup_*.csv
+data/raw/new_course_draft.json
+
+# Prédictions générées
+data/processed/predictions_top4.csv
+
+# Modèles volumineux
+models/*.joblib
+models/best_metrics.json
+
+# Archives
+*.zip

@@ -24,7 +24,7 @@ def _sanitize_colnames(cols):
 
 def build_dataset(courses: pd.DataFrame, cfg: Dict):
     """
-    Construit X, y, meta pour un modèle multiclasses prédisant `columns.target` (ex: a2).
+    Construit X, y, meta pour un modèle multiclasses prédisant `columns.target` (ex: a1).
 
     Anti-fuite par défaut :
       - rapport

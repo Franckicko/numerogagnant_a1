@@ -1,5 +1,5 @@
 data:
-  courses_csv: data/raw/Courses_Completes_a2.csv
+  courses_csv: data/raw/Courses_Completes_a1.csv
   hippodromes_csv: data/raw/hippodrome.csv
   csv_sep: ','
 columns:
@@ -7,7 +7,7 @@ columns:
   - date
   - hippodrome
   - numcourse
-  target: a2
+  target: a1
   drop_cols_regex: ^(rapport|r_b\d+|si_a\d+_dans_pronos|pred\d+_a\d+|a\d+_.*)$
   categorical:
   - discipline
