@@ -188,35 +188,22 @@ def upsert_pending(save_row: dict) -> str:
 def _reload_all():
     """Relit CSV + modèle et recalcule features. Stocke en session."""
     main_path = COURSES_PATH
-    # fallback depuis config.yaml sinon valeur par défaut dans ex_data/
-    sample_cfg = cfg.get("data", {}).get("sample_csv", "ex_data/Courses_Completes_a1_sample.csv")
-    sample_path = ROOT / sample_cfg
+    sample_path = SAMPLE_PATH
 
     use_path = main_path if main_path.exists() else sample_path
     if not use_path.exists():
         st.error(
-            "Fichier de données introuvable.\n\n"
-            "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni l'exemple "
-            "`ex_data/Courses_Completes_a1_sample.csv` ne sont présents dans le dépôt."
+            "Fichier introuvable.\n\n"
+            "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni "
+            "`ex_data/Courses_Completes_a1_sample.csv` (exemple) ne sont présents."
         )
         st.stop()
 
     if use_path != main_path:
         st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
 
-    use_path = COURSES_PATH if COURSES_PATH.exists() else SAMPLE_PATH
-if not use_path.exists():
-    st.error(
-        "Fichier introuvable.\n\n"
-        "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni "
-        "`ex_data/Courses_Completes_a1_sample.csv` (exemple) ne sont présents."
-    )
-    st.stop()
+    courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
 
-if use_path != COURSES_PATH:
-    st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
-
-courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
     X, y, meta, _ = build_dataset(courses, cfg)
     st.session_state["__X__"] = X
     st.session_state["__y__"] = y
