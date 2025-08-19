@@ -31,3 +31,7 @@ training:
     num_class: 18
   test_size: 0.2
   random_state: 42
+data:
+  csv_sep: ","
+  courses_csv: data/raw/Courses_Completes_a1.csv
+  sample_csv: ex_data/Courses_Completes_a1_sample.csv

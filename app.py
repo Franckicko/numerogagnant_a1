@@ -186,11 +186,29 @@ def upsert_pending(save_row: dict) -> str:
 
 def _reload_all():
     """Relit CSV + modèle et recalcule features. Stocke en session."""
-    courses = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+    main_path = COURSES_PATH
+    # fallback depuis config.yaml sinon valeur par défaut dans ex_data/
+    sample_cfg = cfg.get("data", {}).get("sample_csv", "ex_data/Courses_Completes_a1_sample.csv")
+    sample_path = ROOT / sample_cfg
+
+    use_path = main_path if main_path.exists() else sample_path
+    if not use_path.exists():
+        st.error(
+            "Fichier de données introuvable.\n\n"
+            "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni l'exemple "
+            "`ex_data/Courses_Completes_a1_sample.csv` ne sont présents dans le dépôt."
+        )
+        st.stop()
+
+    if use_path != main_path:
+        st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
+
+    courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
     X, y, meta, _ = build_dataset(courses, cfg)
     st.session_state["__X__"] = X
     st.session_state["__y__"] = y
     st.session_state["__meta__"] = meta
+
     bundle = joblib.load(MODEL_PATH)
     st.session_state["__model__"] = bundle["model"]
     st.session_state["__le__"] = bundle["label_encoder"]
