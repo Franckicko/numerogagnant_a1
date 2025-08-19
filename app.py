@@ -1,443 +1,587 @@
-# app.py — Numero Gagnant A1 (Top-4)
+# app.py
+from __future__ import annotations
 
-from pathlib import Path
-from datetime import date
-import joblib, yaml
-import pandas as pd
-import numpy as np
+import os
 import streamlit as st
+import numpy as np
+import pandas as pd, yaml, joblib, json
+from pathlib import Path
+from sklearn.metrics import log_loss
+from datetime import datetime, date
+import xgboost as xgb
 
-# ---------- Page & debug versions ----------
-st.set_page_config(page_title="Numero Gagnant – A1", layout="wide")
-st.write("🚀 App boot…")
-try:
-    import sklearn, numpy as _np, pandas as _pd
-    st.caption(f"sklearn {sklearn.__version__} | numpy {_np.__version__} | pandas {_pd.__version__}")
-except Exception:
-    pass
+from src.features import build_dataset
+from src.train import train_and_save  # bouton de ré-entraînement
 
-# ---------- Chemins ----------
+# ---------- constantes ----------
 ROOT = Path(__file__).resolve().parent
-DATA_PROC = ROOT / "data" / "processed"
 MODEL_PATH = ROOT / "models" / "xgb_multiclass.joblib"
-HIPPO_CSV_DEFAULT = ROOT / "data" / "raw" / "hippodrome.csv"
+COURSES_PATH = ROOT / "data" / "raw" / "Courses_Completes_a1.csv"
+PENDING_PATH = ROOT / "data" / "raw" / "pending_courses.csv"
+HIPPODROMES_PATH = ROOT / "data" / "raw" / "hippodrome.csv"
+DRAFT_PATH = ROOT / "data" / "raw" / "ui_draft.json"
+PREDICTIONS_PATH = ROOT / "data" / "processed" / "predictions_top4.csv"
+METRICS_HIST_PATH = ROOT / "data" / "processed" / "metrics_history.csv"
 
-# ---------- Imports projet ----------
-from src.features import build_feature_frame
-from src.metrics import logloss_top4_renorm
+# ---------- config ----------
+st.set_page_config(page_title="Numero Gagnant - Multiclass", layout="wide")
+cfg = yaml.safe_load(open(ROOT / "config.yaml", "r", encoding="utf-8"))
+sep = cfg["data"].get("csv_sep", ",")
+rid_fields = cfg["columns"]["race_id_fields"]
+target_col = cfg["columns"]["target"]  # 'a1'
+cat_cfg = cfg["columns"].get("categorical", [])
 
-# ---------- Shim compatible pour anciens pickles ----------
-from sklearn.pipeline import Pipeline
+st.title(f"🎯 Numero Gagnant – Prédiction de {target_col} (Top 4)")
 
-class PreprocBooster:
-    """Compat: certains pickles contiennent un objet avec .pre / .clf ou .pipe/.model"""
-    def __init__(self, pre=None, clf=None, pipe=None, model=None):
-        self.pre = pre; self.clf = clf; self.pipe = pipe; self.model = model
-        self._cached = None
+# ---------- session init ----------
+# (pas de valeur par défaut pour new_date -> évite le warning Streamlit)
+DEFAULTS = {
+    "new_discipline": "", "new_hippodrome": "", "new_numcourse": "",
+    "new_partants": 12, "new_distance": 2700,
+    **{f"new_prono{i}": 1 for i in range(1, 9)},
+    "new_row_cached": None, "new_pred_cached": None,
+    "__X__": None, "__y__": None, "__meta__": None,
+    "__model__": None, "__le__": None, "__feat_cols__": None, "__calib__": None
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-    def _as_estimator(self):
-        if self._cached is not None:
-            return self._cached
-        if self.pipe is not None:
-            self._cached = self.pipe
-        elif self.model is not None:
-            self._cached = self.model
-        elif (self.pre is not None) and (self.clf is not None):
-            self._cached = Pipeline([("pre", self.pre), ("clf", self.clf)])
-        else:
-            self._cached = self
-        return self._cached
+# ---------- brouillon (persistant) ----------
+def _serialize_for_json(val):
+    if isinstance(val, date):
+        return val.isoformat()
+    return val
 
-    def predict_proba(self, X):
-        est = self._as_estimator()
-        if hasattr(est, "predict_proba"):
-            return est.predict_proba(X)
-        raise AttributeError("PreprocBooster shim: aucun 'predict_proba' disponible")
+def _save_draft():
+    (ROOT / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    payload = {
+        "new_date": st.session_state.get("new_date"),
+        "new_discipline": st.session_state.get("new_discipline"),
+        "new_hippodrome": st.session_state.get("new_hippodrome"),
+        "new_numcourse": st.session_state.get("new_numcourse"),
+        "new_partants": st.session_state.get("new_partants"),
+        "new_distance": st.session_state.get("new_distance"),
+        **{f"new_prono{i}": st.session_state.get(f"new_prono{i}") for i in range(1, 9)},
+    }
+    payload = {k: _serialize_for_json(v) for k, v in payload.items()}
+    with open(DRAFT_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-# ---------- Utils I/O ----------
-def ensure_files() -> Path:
-    DATA_PROC.mkdir(parents=True, exist_ok=True)
-    preds = DATA_PROC / "predictions_top4.csv"
-    if not preds.exists():
-        pd.DataFrame(
-            columns=[
-                "race_id","date","hippodrome","numcourse",
-                "partants","distance","discipline",
-                "true_a1",
-                "pred1_a1","pred2_a1","pred3_a1","pred4_a1",
-                "proba1","proba2","proba3","proba4",
-                "hit1","hit2","hit4",
-                "p_true_raceaware","logloss_item_raceaware","logloss_item_top4",
-            ]
-        ).to_csv(preds, index=False, encoding="utf-8")
-    return preds
-
-def _coerce_to_estimator(obj):
-    """Retourne un objet qui possède predict_proba (dict/wrapper/pipeline -> estimator)."""
-    # dict sauvé {"model": ..., "classes": ...}
-    if isinstance(obj, dict) and "model" in obj:
-        return _coerce_to_estimator(obj["model"])
-
-    # déjà bon ?
-    if hasattr(obj, "predict_proba"):
-        return obj
-
-    # wrappers fréquents
-    for attr in ("pipe", "model"):
-        if hasattr(obj, attr):
-            inner = getattr(obj, attr)
-            if hasattr(inner, "predict_proba"):
-                return inner
-
-    if hasattr(obj, "pre") and hasattr(obj, "clf"):
-        return Pipeline([("pre", getattr(obj, "pre")), ("clf", getattr(obj, "clf"))])
-
-    raise RuntimeError(
-        "Le modèle chargé n'expose pas predict_proba. "
-        "Repackez/sauvegardez le modèle au format {'model': pipeline, 'classes': [...] }."
-    )
-
-def load_model_and_cfg():
-    raw = joblib.load(MODEL_PATH)
-    classes = None
-    if isinstance(raw, dict) and "classes" in raw:
-        classes = raw.get("classes")
-        raw = raw.get("model")
-    model = _coerce_to_estimator(raw)
-    cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
-    num_classes = int(max(classes)) if classes is not None else None
-    return model, num_classes, cfg
-
-def append_or_update_row(row: dict) -> pd.DataFrame:
-    preds_path = ensure_files()
-    df = pd.read_csv(preds_path) if preds_path.exists() else pd.DataFrame()
-    if not df.empty and "race_id" in df.columns and (df["race_id"] == row["race_id"]).any():
-        mask = df["race_id"] == row["race_id"]
-        for k, v in row.items():
-            if k not in df.columns:
-                df[k] = np.nan
-            df.loc[mask, k] = v
-    else:
-        for k in row.keys():
-            if k not in df.columns:
-                df[k] = np.nan
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(preds_path, index=False, encoding="utf-8")
-    return df
-
-def _race_id(dte: str, hippodrome: str, numcourse: str) -> str:
-    return f'{pd.to_datetime(dte).strftime("%Y-%m-%d")}_{hippodrome}_{numcourse}'
-
-# ---------- Hippodromes ----------
-def load_hippo_list() -> list[str]:
-    """Charge la liste d'hippodromes depuis data/raw/hippodrome.csv (si présent)."""
-    path = HIPPO_CSV_DEFAULT
+def _load_draft_into_session():
+    if not DRAFT_PATH.exists():
+        return
     try:
-        df = pd.read_csv(path, encoding="utf-8")
-        # colonne candidate: 'hippodrome', 'nom' ou 'name'
-        cand = [c for c in df.columns if c.lower() in ("hippodrome", "nom", "name")]
-        col = cand[0] if cand else df.columns[0]
-        hippos = sorted(pd.Series(df[col].astype(str).unique()).dropna())
-        return [h for h in hippos if h.strip()]
+        data = json.loads(Path(DRAFT_PATH).read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return
+    # Date
+    if "new_date" in data and data["new_date"]:
+        try:
+            y_, m_, d_ = [int(x) for x in str(data["new_date"]).split("-")]
+            st.session_state["new_date"] = date(y_, m_, d_)
+        except Exception:
+            pass
+    # Strings
+    for k in ("new_discipline", "new_hippodrome", "new_numcourse"):
+        if k in data and data[k] is not None:
+            st.session_state[k] = data[k]
+    # Entiers
+    for k in ("new_partants", "new_distance", *[f"new_prono{i}" for i in range(1, 9)]):
+        if k in data and data[k] is not None:
+            try:
+                st.session_state[k] = int(float(data[k]))
+            except Exception:
+                pass
 
-# =============================================================================
-#                           PRÉDICTION & VÉRITÉ
-# =============================================================================
-def predict_top4(args: dict):
-    model, classes, cfg = load_model_and_cfg()
-    pronos = [int(x.strip()) for x in str(args["pronos"]).split(",") if x.strip()]
+# Charger brouillon avant l’UI
+_load_draft_into_session()
 
-    row = {
-        "date": pd.to_datetime(args["date"]),
-        "hippodrome": args["hippodrome"],
-        "numcourse": args["numcourse"],
-        "partants": int(args["partants"]),
-        "distance": float(args["distance"]),
-        "discipline": str(args.get("discipline","galop")).lower(),
-        **{f"prono{i}": n for i, n in enumerate(pronos, 1)},
-    }
-    X = build_feature_frame(pd.DataFrame([row]), cfg["prono_cols"], cfg["num_features"], cfg["cat_features"])
+# ---------- helpers modèle/proba ----------
+def predict_proba_any(model, X, n_classes: int):
+    """Renvoie (n_samples, n_classes) pour Booster ou XGBClassifier."""
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        proba = np.asarray(proba)
+        if proba.ndim == 1:
+            proba = proba.reshape(-1, n_classes)
+        return proba
+    dmat = xgb.DMatrix(X)
+    raw = np.asarray(model.predict(dmat))  # Booster: multi:softprob
+    if raw.ndim == 1:
+        raw = raw.reshape(-1, n_classes)
+    return raw
 
-    proba_vec = model.predict_proba(X)[0]
-    num_classes = int(max(classes)) if classes is not None else len(proba_vec)
+def apply_temperature(model, X, proba, calibrator):
+    """Applique la calibration température si présente. Utilise margins si possible."""
+    if not calibrator or calibrator.get("type") != "temperature":
+        return proba
+    T = float(calibrator.get("T", 1.0))
+    margins = None
+    try:
+        if hasattr(model, "predict_proba"):
+            margins = model.predict(X, output_margin=True)
+        else:
+            dmat = xgb.DMatrix(X)
+            margins = model.predict(dmat, output_margin=True)
+    except Exception:
+        margins = None
+    if margins is not None:
+        z = margins / T
+        z = z - z.max(axis=1, keepdims=True)
+        proba = np.exp(z)
+        proba /= proba.sum(axis=1, keepdims=True)
+        return proba
+    # fallback via log(proba)
+    z = np.log(np.clip(proba, 1e-15, 1.0)) / T
+    z = z - z.max(axis=1, keepdims=True)
+    proba = np.exp(z)
+    proba /= proba.sum(axis=1, keepdims=True)
+    return proba
 
-    pairs = []
-    for numero in pronos:
-        p = float(proba_vec[int(numero) - 1]) if 1 <= int(numero) <= num_classes else 0.0
-        pairs.append((int(numero), p))
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    top = pairs[:4]
-    top_nums = [n for n,_ in top]
-    top_probs = [p for _,p in top]
+# ---------- utils data ----------
+def make_race_id(df: pd.DataFrame) -> pd.Series:
+    return df[rid_fields].astype(str).agg("_".join, axis=1)
 
-    out = {
-        "race_id": _race_id(args["date"], args["hippodrome"], args["numcourse"]),
-        "date": pd.to_datetime(args["date"]).strftime("%Y-%m-%d"),
-        "hippodrome": args["hippodrome"],
-        "numcourse": args["numcourse"],
-        "partants": int(args["partants"]),
-        "distance": float(args["distance"]),
-        "discipline": str(args.get("discipline","galop")).lower(),
-        "pred1_a1": top_nums[0] if len(top_nums)>0 else np.nan,
-        "pred2_a1": top_nums[1] if len(top_nums)>1 else np.nan,
-        "pred3_a1": top_nums[2] if len(top_nums)>2 else np.nan,
-        "pred4_a1": top_nums[3] if len(top_nums)>3 else np.nan,
-        "proba1": top_probs[0] if len(top_probs)>0 else np.nan,
-        "proba2": top_probs[1] if len(top_probs)>1 else np.nan,
-        "proba3": top_probs[2] if len(top_probs)>2 else np.nan,
-        "proba4": top_probs[3] if len(top_probs)>3 else np.nan,
-    }
-    return out, top_nums, top_probs
+def backup(path: Path):
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bkp = path.with_name(f"{path.stem}_backup_{ts}.csv")
+    if path.exists():
+        pd.read_csv(path, sep=sep, encoding="utf-8").to_csv(bkp, index=False, sep=sep, encoding="utf-8")
+    return bkp
 
-def update_truth(args: dict):
-    model, classes, cfg = load_model_and_cfg()
-    pronos = [int(x.strip()) for x in str(args["pronos"]).split(",") if x.strip()]
-    K = int(args["partants"])
-
-    row = {
-        "date": pd.to_datetime(args["date"]),
-        "hippodrome": args["hippodrome"],
-        "numcourse": args["numcourse"],
-        "partants": K,
-        "distance": float(args["distance"]),
-        "discipline": str(args.get("discipline","galop")).lower(),
-        **{f"prono{i}": n for i, n in enumerate(pronos, 1)},
-    }
-    X = build_feature_frame(pd.DataFrame([row]), cfg["prono_cols"], cfg["num_features"], cfg["cat_features"])
-    proba = model.predict_proba(X)[0]
-    num_classes = int(max(classes)) if classes is not None else len(proba)
-
-    preds_path = ensure_files()
-    dfp = pd.read_csv(preds_path)
-    race_id = _race_id(args["date"], args["hippodrome"], args["numcourse"])
-    mask = (dfp["race_id"] == race_id) if "race_id" in dfp.columns and not dfp.empty else pd.Series([], dtype=bool)
-    if mask.any():
-        rowp = dfp.loc[mask].iloc[0]
-        top_nums = [int(rowp.get(f"pred{i}_a1")) for i in range(1,5)]
-        top_probs = [float(rowp.get(f"proba{i}")) for i in range(1,5)]
+def upsert_pending(save_row: dict) -> str:
+    """Ajoute / met à jour dans pending_courses.csv (clé = race_id)."""
+    save_row = save_row.copy()
+    save_row["race_id"] = "_".join(str(save_row.get(k, "")) for k in rid_fields)
+    try:
+        hist = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+    except Exception:
+        hist = pd.DataFrame()
+    if "race_id" not in hist.columns and all(k in hist.columns for k in rid_fields):
+        hist["race_id"] = make_race_id(hist)
+    if "race_id" in hist.columns and save_row["race_id"] in set(hist["race_id"].astype(str)):
+        return "exists_hist"
+    if PENDING_PATH.exists():
+        pend = pd.read_csv(PENDING_PATH, sep=sep, encoding="utf-8")
     else:
-        pairs = []
-        for n in pronos:
-            p = float(proba[n-1]) if 1 <= n <= num_classes else 0.0
-            pairs.append((n,p))
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        top_nums = [n for n,_ in pairs[:4]]
-        top_probs = [p for _,p in pairs[:4]]
+        pend = pd.DataFrame()
+    for k in list(save_row.keys()) + [target_col, "rapport"]:
+        if k not in pend.columns:
+            pend[k] = pd.NA
+    if "race_id" in pend.columns:
+        mask = pend["race_id"].astype(str) == save_row["race_id"]
+        if mask.any():
+            idx = pend.index[mask][0]
+            for k, v in save_row.items():
+                if k in [target_col, "rapport"] and pd.notna(pend.at[idx, k]):
+                    continue
+                pend.at[idx, k] = v
+            pend.to_csv(PENDING_PATH, index=False, sep=sep, encoding="utf-8")
+            return "updated"
+    pend = pd.concat([pend, pd.DataFrame([save_row])], ignore_index=True)
+    (ROOT / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    pend.to_csv(PENDING_PATH, index=False, sep=sep, encoding="utf-8")
+    return "inserted"
 
-    denom = float(proba[:K].sum()) if K <= len(proba) else float(proba.sum())
-    true_num = int(args["true"])
-    p_true_race = (float(proba[true_num - 1]) / denom) if (1 <= true_num <= len(proba) and denom > 0) else (1.0 / max(K,1))
-    ll_race = -np.log(max(p_true_race, 1e-15))
-    ll_top4 = logloss_top4_renorm(true_num, top_nums, top_probs)
+def _reload_all():
+    """Relit CSV + modèle et recalcule features. Stocke en session."""
+    courses = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+    X, y, meta, _ = build_dataset(courses, cfg)
+    st.session_state["__X__"] = X
+    st.session_state["__y__"] = y
+    st.session_state["__meta__"] = meta
+    bundle = joblib.load(MODEL_PATH)
+    st.session_state["__model__"] = bundle["model"]
+    st.session_state["__le__"] = bundle["label_encoder"]
+    st.session_state["__feat_cols__"] = bundle["feature_columns"]
+    st.session_state["__calib__"] = bundle.get("calibrator")
 
-    hit1 = int(true_num == top_nums[0]) if top_nums else 0
-    hit2 = int(true_num in top_nums[:2])
-    hit4 = int(true_num in top_nums[:4])
+def _ensure_loaded():
+    if st.session_state["__X__"] is None:
+        _reload_all()
 
-    out = {
-        "race_id": race_id,
-        "date": pd.to_datetime(args["date"]).strftime("%Y-%m-%d"),
-        "hippodrome": args["hippodrome"],
-        "numcourse": args["numcourse"],
-        "partants": K,
-        "distance": float(args["distance"]),
-        "discipline": str(args.get("discipline","galop")).lower(),
-        "true_a1": true_num,
-        "hit1": hit1, "hit2": hit2, "hit4": hit4,
-        "p_true_raceaware": p_true_race,
-        "logloss_item_raceaware": ll_race,
-        "logloss_item_top4": ll_top4,
-    }
+def _to_int_display(values):
+    out = []
+    for v in values:
+        try:
+            out.append(int(float(v)))
+        except Exception:
+            out.append(v)
     return out
 
-# ---------- Métriques ----------
-def compute_dashboard_metrics(df: pd.DataFrame):
-    d = df[df["true_a1"].notna()].copy() if not df.empty else pd.DataFrame()
-    if d.empty:
-        return None
-    hit1 = pd.to_numeric(d["hit1"], errors="coerce")
-    hit4 = pd.to_numeric(d["hit4"], errors="coerce")
-    ll_race = pd.to_numeric(d["logloss_item_raceaware"], errors="coerce")
-    return {"H1": float(hit1.mean()), "H4": float(hit4.mean()), "LL": float(ll_race.mean())}
+# ---------- chargement mémoire ----------
+_ensure_loaded()
+X = st.session_state["__X__"]; y = st.session_state["__y__"]
+meta = st.session_state["__meta__"]; model = st.session_state["__model__"]
+le = st.session_state["__le__"]; feat_cols = st.session_state["__feat_cols__"]
+calibrator = st.session_state["__calib__"]
+X_all = X.reindex(columns=feat_cols, fill_value=0)
+class_labels = le.classes_
+n_classes = len(class_labels)
 
-def block_two_periods(df: pd.DataFrame, cutoff_str: str):
-    if df.empty: return None, None
-    df = df.copy()
+# ---------- sidebar ----------
+with st.sidebar:
+    st.markdown("## Configuration")
+    st.json(cfg)
+    st.markdown("---")
+    if st.button("🔄 Recharger données & métriques"):
+        _reload_all()
+        st.toast("Données/métriques rechargées.", icon="✅")
+        st.rerun()
+    if st.button("🔁 Ré-entraîner le modèle"):
+        with st.spinner("Entraînement en cours..."):
+            info = train_and_save(ROOT / "config.yaml")
+        _reload_all()
+        st.success(f"Modèle ré-entraîné • Hit@1={info['hit1']:.3f} • Hit@4={info['hit4']:.3f} • LogLoss={info['logloss']:.4f}")
+        st.rerun()
+with st.sidebar.expander("🛠️ Diagnostic (chemins)"):
+    st.write("App path:", Path(__file__).resolve())
+    st.write("Working dir:", Path.cwd())
+    st.write("Courses CSV:", COURSES_PATH.resolve())
+    st.write("Model path:", MODEL_PATH.resolve())
 
-    def extract_date(rid):
-        try: return rid.split("_",1)[0]
-        except Exception: return None
+# ---------- onglets ----------
+tab_dash, tab_explore, tab_hist, tab_new, tab_validate = st.tabs(
+    ["📊 Dashboard", "🔎 Explorer", "Historique (données existantes)", "➕ Nouvelle course", "✅ Validation des résultats"]
+)
 
-    df["date"] = pd.to_datetime(df["race_id"].astype(str).map(extract_date), errors="coerce")
-    df = df[df["date"].notna() & df["true_a1"].notna()]
-    cut = pd.to_datetime(cutoff_str)
+# ======= Dashboard =======
+with tab_dash:
+    st.subheader("Vue d’ensemble")
+    proba_all = apply_temperature(model, X_all, predict_proba_any(model, X_all, n_classes), calibrator)
+    order_all = np.argsort(-proba_all, axis=1)[:, :4]
+    top_labels_all = class_labels[order_all]
+    y_enc_all = le.transform(y.values)
+    true_labels_all = class_labels[y_enc_all]
 
-    def agg(x):
-        if len(x) == 0:
-            return {"n": 0, "hit4": np.nan, "ll_race": np.nan, "ll_top4": np.nan}
-        return {
-            "n": int(len(x)),
-            "hit4": float(pd.to_numeric(x["hit4"], errors="coerce").mean()),
-            "ll_race": float(pd.to_numeric(x["logloss_item_raceaware"], errors="coerce").mean()),
-            "ll_top4": float(pd.to_numeric(x["logloss_item_top4"], errors="coerce").mean()),
-        }
-    return agg(df[df["date"]<=cut]), agg(df[df["date"]>cut])
+    hit1 = float((top_labels_all[:, 0] == true_labels_all).mean())
+    hit4 = float(np.mean([t in row for t, row in zip(true_labels_all, top_labels_all)]))
+    ll = float(log_loss(y_enc_all, proba_all, labels=np.arange(n_classes)))
+    proba1_mean = float(proba_all[np.arange(len(proba_all)), order_all[:, 0]].mean())
 
-# =============================================================================
-#                                   UI
-# =============================================================================
-preds_path = ensure_files()
-dfp = pd.read_csv(preds_path) if preds_path.exists() else pd.DataFrame()
-dash = compute_dashboard_metrics(dfp)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Hit@1 (Top-1 exact)", f"{hit1:.3f}")
+    c2.metric("Hit@4 (Gagnant dans Top-4)", f"{hit4:.3f}")
+    c3.metric("LogLoss", f"{ll:.4f}")
+    st.caption(f"Proba1_mean: {proba1_mean:.3f}")
 
-st.title("🎯 Numero Gagnant – A1 (Top-4)")
-c1, c2, c3 = st.columns(3)
-c1.metric("Hit@1 (exact gagnant)", f"{(dash['H1']*100):.1f}%" if dash else "—")
-c2.metric("Hit@4 (gagnant ∈ Top-4)", f"{(dash['H4']*100):.1f}%" if dash else "—")
-c3.metric("Vrai LogLoss (race-aware)", f"{dash['LL']:.4f}" if dash else "—")
-
-tabs = st.tabs(["📜 Historique", "➕ Nouvelle course", "✅ Validation", "📈 2 périodes"])
-
-# ---- Historique
-with tabs[0]:
-    if dfp.empty:
-        st.info("Aucune course prédite pour le moment.")
-    else:
-        rid = st.selectbox("Course", options=dfp["race_id"].tolist(), key="hist_rid")
-        row = dfp[dfp["race_id"]==rid].iloc[0]
-        st.write("**Top-4 prédits**")
-        st.dataframe(pd.DataFrame({
-            "rang": [1,2,3,4],
-            "numero": [row.get("pred1_a1"),row.get("pred2_a1"),row.get("pred3_a1"),row.get("pred4_a1")],
-            "proba": [row.get("proba1"),row.get("proba2"),row.get("proba3"),row.get("proba4")]
-        }))
-
-# ---- Nouvelle course
-with tabs[1]:
-    st.subheader("Renseigner la course & lancer la prédiction Top-4")
-    col1,col2,col3 = st.columns(3)
-    dte = col1.date_input("Date", value=date.today(), key="nc_date")
-    # Hippodrome depuis CSV (fallback text)
-    hippo_opts = load_hippo_list()
-    if hippo_opts:
-        hip = col2.selectbox("Hippodrome", hippo_opts, index=hippo_opts.index("Deauville") if "Deauville" in hippo_opts else 0, key="nc_hip")
-    else:
-        hip = col2.text_input("Hippodrome", value="Deauville", key="nc_hip")
-    nc  = col3.selectbox("Numcourse", [f"C{i}" for i in range(1,11)], index=2, key="nc_course")
-
-    col4,col5,col6 = st.columns(3)
-    part = col4.number_input("Partants", min_value=2, max_value=24, value=16, step=1, key="nc_partants")
-    dist = col5.number_input("Distance (m)", min_value=400, max_value=5000, value=2000, step=50, key="nc_dist")
-    disc = col6.selectbox("Discipline", options=["galop","trot"], index=0, key="nc_disc")
-
-    st.caption("Pronos (8 numéros)")
-    pc1, pc2, pc3, pc4 = st.columns(4)
-    pd1, pd2, pd3, pd4 = st.columns(4)
-    p1 = pc1.number_input("prono1", 1, 24, 9,  key="p1")
-    p2 = pc2.number_input("prono2", 1, 24, 13, key="p2")
-    p3 = pc3.number_input("prono3", 1, 24, 15, key="p3")
-    p4 = pc4.number_input("prono4", 1, 24, 12, key="p4")
-    p5 = pd1.number_input("prono5", 1, 24, 16, key="p5")
-    p6 = pd2.number_input("prono6", 1, 24, 1,  key="p6")
-    p7 = pd3.number_input("prono7", 1, 24, 6,  key="p7")
-    p8 = pd4.number_input("prono8", 1, 24, 2,  key="p8")
-
-    if st.button("🔮 Prédire Top-4", key="btn_predire_top4"):
-        try:
-            args = {
-                "date": dte.isoformat(),
-                "hippodrome": str(hip).strip(),
-                "numcourse": str(nc).strip(),
-                "partants": int(part),
-                "distance": float(dist),
-                "discipline": disc,
-                "pronos": ",".join(map(str, [p1,p2,p3,p4,p5,p6,p7,p8])),
-            }
-            out, top_nums, top_probs = predict_top4(args)
-            row = {"race_id": out["race_id"], **out, "true_a1": None}
-            dfp = append_or_update_row(row)
-            st.success(f"Top-4 pour {out['race_id']}")
-            st.dataframe(pd.DataFrame({
-                "rang":[1,2,3,4],
-                "numero":[out['pred1_a1'], out['pred2_a1'], out['pred3_a1'], out['pred4_a1']],
-                "proba":[out['proba1'], out['proba2'], out['proba3'], out['proba4']],
-            }))
-        except Exception as e:
-            st.error("Erreur dans 'Nouvelle course'")
-            st.exception(e)
-
-# ---- Validation
-with tabs[2]:
-    st.subheader("Valider l’arrivée (vérité) et mettre à jour les métriques")
-    if dfp.empty:
-        st.info("Aucune course prédite à valider.")
-    else:
-        rid = st.selectbox("Course à valider", options=dfp["race_id"].tolist(), key="val_rid")
-        c1,c2,c3 = st.columns(3)
-        dte2 = c1.text_input("Date (YYYY-MM-DD)", value=rid.split("_",1)[0], key="val_date")
-        hip2 = c2.text_input("Hippodrome", value=rid.split("_")[1], key="val_hip")
-        nc2  = c3.text_input("Numcourse", value=rid.split("_")[2], key="val_course")
-        c4,c5,c6 = st.columns(3)
-        part2 = c4.number_input("Partants", 2, 24, 16, 1, key="val_part")
-        dist2 = c5.number_input("Distance (m)", 400, 5000, 2000, 50, key="val_dist")
-        disc2 = c6.selectbox("Discipline", ["galop","trot"], index=0, key="val_disc")
-
-        pr_def = []
-        for i in range(1,5):
-            v = dfp.loc[dfp["race_id"]==rid, f"pred{i}_a1"]
-            pr_def.append(int(v.iloc[0]) if len(v) and pd.notna(v.iloc[0]) else i)
-        pr_def += [5,6,7,8]
-        c7,c8,c9,c10 = st.columns(4)
-        c11,c12,c13,c14 = st.columns(4)
-        q1 = c7.number_input("prono1", 1, 24, pr_def[0], key="val_p1")
-        q2 = c8.number_input("prono2", 1, 24, pr_def[1], key="val_p2")
-        q3 = c9.number_input("prono3", 1, 24, pr_def[2], key="val_p3")
-        q4 = c10.number_input("prono4", 1, 24, pr_def[3], key="val_p4")
-        q5 = c11.number_input("prono5", 1, 24, pr_def[4], key="val_p5")
-        q6 = c12.number_input("prono6", 1, 24, pr_def[5], key="val_p6")
-        q7 = c13.number_input("prono7", 1, 24, pr_def[6], key="val_p7")
-        q8 = c14.number_input("prono8", 1, 24, pr_def[7], key="val_p8")
-
-        true_num = st.number_input("Numéro gagnant (a1)", 1, 24, 6, 1, key="val_true")
-        if st.button("💾 Valider", key="btn_valider"):
+    st.markdown("### Historique des runs")
+    if METRICS_HIST_PATH.exists():
+        hist = pd.read_csv(METRICS_HIST_PATH, encoding="utf-8")
+        if not hist.empty and "datetime" in hist.columns:
             try:
-                args = {
-                    "date": dte2, "hippodrome": hip2, "numcourse": nc2,
-                    "true": int(true_num),
-                    "pronos": ",".join(map(str, [q1,q2,q3,q4,q5,q6,q7,q8])),
-                    "partants": int(part2), "distance": float(dist2), "discipline": disc2,
-                }
-                upd = update_truth(args)
-                dfp = append_or_update_row(upd)
-                st.success(
-                    f"Mise à jour OK — H@4={upd['hit4']}  |  "
-                    f"ll_race={upd['logloss_item_raceaware']:.4f}  |  "
-                    f"ll_top4={upd['logloss_item_top4']:.4f}"
-                )
-            except Exception as e:
-                st.error("Erreur dans 'Validation'")
-                st.exception(e)
-
-# ---- 2 périodes
-with tabs[3]:
-    st.subheader("Comparer 2 périodes (fixe vs dynamique)")
-    cutoff = st.date_input("Date de coupure", value=date.today(), key="cutoff")
-    b1, b2 = block_two_periods(dfp, cutoff.isoformat())
-    def fmt_pct(x): return "—" if (x is None or np.isnan(x)) else f"{100*x:0.2f}%"
-    def fmt_ll(x):  return "—" if (x is None or np.isnan(x)) else f"{x:0.4f}"
-    colA,colB = st.columns(2)
-    if b1 is None:
-        st.info("Aucune course validée.")
+                hist["datetime"] = pd.to_datetime(hist["datetime"], errors="coerce")
+                hist = hist.dropna(subset=["datetime"]).sort_values("datetime")
+                idx = hist["datetime"].astype(str)
+            except Exception:
+                idx = hist["datetime"]
+            cA, cB = st.columns(2)
+            with cA:
+                cols = [c for c in ["Hit@1", "Hit@4"] if c in hist.columns]
+                if cols and len(hist) > 0:
+                    st.line_chart(hist.set_index(idx)[cols])
+            with cB:
+                if "LogLoss" in hist.columns and len(hist) > 0:
+                    st.line_chart(hist.set_index(idx)[["LogLoss"]])
+            st.dataframe(hist.tail(20), use_container_width=True)
+        else:
+            st.info("Historique vide. Lance `python -m src.predict` au moins une fois.")
     else:
-        with colA:
-            st.markdown(f"### ≤ {cutoff.isoformat()}  (N={b1['n']})")
-            st.write(f"Hit@4 : {fmt_pct(b1['hit4'])}")
-            st.write(f"Vrai LogLoss : {fmt_ll(b1['ll_race'])}")
-            st.write(f"Faux LogLoss Top-4 : {fmt_ll(b1['ll_top4'])}")
-        with colB:
-            st.markdown(f"### > {cutoff.isoformat()}  (N={b2['n']})")
-            st.write(f"Hit@4 : {fmt_pct(b2['hit4'])}")
-            st.write(f"Vrai LogLoss : {fmt_ll(b2['ll_race'])}")
-            st.write(f"Faux LogLoss Top-4 : {fmt_ll(b2['ll_top4'])}")
+        st.info("Pas encore de metrics_history.csv. Lance `python -m src.predict`.")
+
+# ======= Explorer =======
+def _load_predictions_df():
+    if not PREDICTIONS_PATH.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(PREDICTIONS_PATH, encoding="utf-8")
+    if "race_id" in df.columns:
+        parts = df["race_id"].astype(str).str.split("_", n=2, expand=True)
+        if parts.shape[1] == 3:
+            df["date"] = parts[0]
+            df["hippodrome"] = parts[1]
+            df["numcourse"] = parts[2]
+    return df
+
+def _race_detail_row(df_pred, rid):
+    if df_pred.empty or rid not in set(df_pred["race_id"]):
+        return None
+    r = df_pred[df_pred["race_id"] == rid].iloc[0].to_dict()
+    top_nums = [int(r.get(f"pred{i}_{target_col}")) for i in range(1, 5)]
+    top_probs = [float(r.get(f"proba{i}")) for i in range(1, 5)]
+    true_num = int(r.get(f"true_{target_col}"))
+    return {
+        "race_id": rid, "top_nums": top_nums, "top_probs": top_probs,
+        "true": true_num, "hippodrome": r.get("hippodrome"),
+        "date": r.get("date"), "numcourse": r.get("numcourse")
+    }
+
+with tab_explore:
+    st.subheader("Navigation par course & recherche")
+    df_pred = _load_predictions_df()
+
+    if df_pred.empty:
+        st.info("Aucune prédiction trouvée. Lance `python -m src.predict` pour créer `predictions_top4.csv`.")
+    else:
+        left, right = st.columns([1, 3])
+        with left:
+            hippos = ["(tous)"] + (sorted(df_pred["hippodrome"].dropna().unique().tolist())
+                                   if "hippodrome" in df_pred.columns else [])
+            hippo = st.selectbox("Hippodrome", hippos, index=0, key="explore_hippo")
+
+            mois = ["(tous)"]
+            if "date" in df_pred.columns:
+                try:
+                    tmp = pd.to_datetime(df_pred["date"], errors="coerce")
+                    months = tmp.dt.to_period("M").astype(str).dropna().unique().tolist()
+                    mois += sorted(months)
+                except Exception:
+                    pass
+            mois_sel = st.selectbox("Mois", mois, index=0, key="explore_month")
+
+        dff = df_pred.copy()
+        if hippo != "(tous)" and "hippodrome" in dff.columns:
+            dff = dff[dff["hippodrome"] == hippo]
+        if mois_sel != "(tous)" and "date" in dff.columns:
+            dt = pd.to_datetime(dff["date"], errors="coerce")
+            dff = dff[dt.dt.to_period("M").astype(str) == mois_sel]
+
+        race_ids = dff["race_id"].tolist()
+        rid = right.selectbox("Course", race_ids, index=0 if race_ids else None, key="explore_course")
+
+        st.markdown("### Tableau des prédictions filtrées")
+        show_cols = [c for c in dff.columns if c in (
+            "race_id", "date", "hippodrome", "numcourse", f"true_{target_col}",
+            f"pred1_{target_col}", "proba1",
+            f"pred2_{target_col}", "proba2",
+            f"pred3_{target_col}", "proba3",
+            f"pred4_{target_col}", "proba4"
+        )]
+        if show_cols:
+            st.dataframe(dff[show_cols], use_container_width=True, height=420)
+
+        if rid:
+            st.markdown("### Détail")
+            detail = _race_detail_row(df_pred, rid)
+            if detail:
+                hit = detail["true"] in detail["top_nums"]
+                st.write(f"**{rid}** — vrai: **{detail['true']}** — {'✅ dans le Top-4' if hit else '❌ pas dans le Top-4'}")
+                fig_data = pd.DataFrame({"rang": [1, 2, 3, 4], "numero": detail["top_nums"], "proba": detail["top_probs"]})
+                st.bar_chart(fig_data.set_index("rang")["proba"])
+
+# ======= Historique (données existantes) =======
+with tab_hist:
+    race_list = meta["race_id"].tolist()
+    rid = st.selectbox("Course", race_list, key="hist_course")
+    if rid:
+        idx = race_list.index(rid)
+        x_row = X_all.iloc[[idx]]
+        proba_row = apply_temperature(model, x_row, predict_proba_any(model, x_row, n_classes), calibrator)[0]
+        order = proba_row.argsort()[::-1][:4]
+        labels = class_labels[order]
+        numeros = _to_int_display(labels)
+        st.subheader("Top 4 numéros prédits")
+        st.dataframe(pd.DataFrame({"rang": [1, 2, 3, 4], "numero": numeros, "proba": proba_row[order]}))
+        vrai = class_labels[le.transform([y.iloc[idx]])][0]
+        st.info(f"Vrai {target_col} : **{int(vrai)}** — "
+                f"{'✅ présent dans le Top-4' if int(vrai) in numeros else '❌ absent du Top-4'}")
+
+# ======= Nouvelle course (ENTIERS + persistance) =======
+with tab_new:
+    st.subheader(f"Saisir une nouvelle course (sans {target_col})")
+    numcourse_opts = [f"C{i}" for i in range(1, 11)]
+    colA, colB, colC, colD = st.columns(4)
+
+    # IMPORTANT : pas de "value=" -> la valeur vient du Session State si présent
+    colA.date_input("date", key="new_date", on_change=_save_draft)
+    colB.selectbox("discipline", ["", "trot", "galop"], key="new_discipline", on_change=_save_draft)
+
+    # --- liste hippodromes (robuste + cache) ---
+    @st.cache_data(show_spinner=False)
+    def _load_hippo_list(path: Path, sep: str) -> list[str]:
+        # 1) depuis hippodrome.csv
+        try:
+            df = pd.read_csv(path, sep=sep, encoding="utf-8")
+            candidates = [c for c in df.columns if c.lower() in ("hippodrome", "nom", "name")]
+            col = candidates[0] if candidates else df.columns[0]
+            vals = sorted(pd.Series(df[col].astype(str)).dropna().unique().tolist())
+            return vals
+        except Exception:
+            pass
+        # 2) fallback depuis l'historique
+        try:
+            df = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+            if "hippodrome" in df.columns:
+                vals = sorted(pd.Series(df["hippodrome"].astype(str)).dropna().unique().tolist())
+                return vals
+        except Exception:
+            pass
+        # 3) sinon, liste vide
+        return []
+
+    hippo_list = _load_hippo_list(HIPPODROMES_PATH, sep)
+    if hippo_list:
+        colC.selectbox("hippodrome", [""] + hippo_list, key="new_hippodrome", on_change=_save_draft)
+    else:
+        colC.text_input("hippodrome", key="new_hippodrome", on_change=_save_draft)
+
+    colD.selectbox("numcourse", [""] + numcourse_opts, key="new_numcourse", on_change=_save_draft)
+
+    col1, col2 = st.columns(2)
+    col1.number_input("partants", min_value=12, max_value=20, step=1, format="%d",
+                      key="new_partants", on_change=_save_draft)
+    col2.number_input("distance (m)", min_value=800, max_value=6000, step=50, format="%d",
+                      key="new_distance", on_change=_save_draft)
+
+    st.markdown("**Pronostics (prono1..prono8)**")
+    cols = st.columns(8)
+    for i in range(1, 9):
+        cols[i - 1].number_input(f"prono{i}", min_value=1, max_value=20, step=1, format="%d",
+                                 key=f"new_prono{i}", on_change=_save_draft)
+
+    def _required_filled():
+        req = [st.session_state.get("new_date"), st.session_state.get("new_discipline"),
+               st.session_state.get("new_hippodrome"), st.session_state.get("new_numcourse"),
+               st.session_state.get("new_partants")]
+        return all(x not in ("", None) for x in req)
+
+    c_pred, c_save, c_reset = st.columns([1, 1, 1])
+
+    if c_pred.button("Prédire le Top-4", type="primary"):
+        if not _required_filled():
+            st.warning("Merci de renseigner au minimum date, discipline, hippodrome, numcourse et partants.")
+        else:
+            new_row = {
+                "date": pd.to_datetime(st.session_state["new_date"]).strftime("%Y-%m-%d"),
+                "discipline": st.session_state["new_discipline"],
+                "hippodrome": st.session_state["new_hippodrome"],
+                "numcourse": st.session_state["new_numcourse"],
+                "partants": int(st.session_state["new_partants"]),
+                "distance": int(st.session_state["new_distance"]),
+                **{f"prono{i}": int(st.session_state.get(f"new_prono{i}", 1)) for i in range(1, 9)},
+            }
+            st.session_state["new_row_cached"] = new_row
+            _save_draft()
+
+            df_new = pd.DataFrame([new_row])
+            df_new["race_id"] = make_race_id(df_new)
+            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce")
+            df_new["year"] = df_new["date"].dt.year
+            df_new["month"] = df_new["date"].dt.month
+            df_new["day"] = df_new["date"].dt.day
+            df_new["dow"] = df_new["date"].dt.dayofweek
+
+            cat_cols = [c for c in cat_cfg if c in df_new.columns]
+            X_new = df_new.drop(columns=["date"])
+            if cat_cols:
+                X_new = pd.get_dummies(X_new, columns=cat_cols, dummy_na=True)
+            X_new = X_new.reindex(columns=feat_cols, fill_value=0)
+
+            proba = apply_temperature(model, X_new, predict_proba_any(model, X_new, n_classes), calibrator)[0]
+            order = proba.argsort()[::-1][:4]
+            labels = class_labels[order]
+            numeros = _to_int_display(labels)
+            st.session_state["new_pred_cached"] = pd.DataFrame(
+                {"rang": [1, 2, 3, 4], "numero": numeros, "proba": proba[order]}
+            )
+            st.success("Top-4 prédit pour la nouvelle course.")
+
+    if st.session_state.get("new_pred_cached") is not None:
+        st.dataframe(st.session_state["new_pred_cached"], use_container_width=True)
+
+    if c_save.button("💾 Enregistrer cette course dans pending_courses.csv"):
+        if not _required_filled():
+            st.warning("Merci de compléter les champs requis avant l'enregistrement.")
+        else:
+            base_row = st.session_state.get("new_row_cached") or {
+                "date": pd.to_datetime(st.session_state.get("new_date")).strftime("%Y-%m-%d"),
+                "discipline": st.session_state.get("new_discipline"),
+                "hippodrome": st.session_state.get("new_hippodrome"),
+                "numcourse": st.session_state.get("new_numcourse"),
+                "partants": int(st.session_state.get("new_partants")),
+                "distance": int(st.session_state.get("new_distance")),
+                **{f"prono{i}": int(st.session_state.get(f"new_prono{i}", 1)) for i in range(1, 9)},
+            }
+            status = upsert_pending(base_row)
+            if status == "exists_hist":
+                st.error("⛔ Cette course est déjà dans l’historique.")
+            elif status == "updated":
+                st.info("✏️ Fiche déjà enregistrée : mise à jour effectuée.")
+                st.session_state["new_pred_cached"] = None
+                st.session_state["new_row_cached"] = None
+            elif status == "inserted":
+                st.success("✅ Course ajoutée dans pending_courses.csv")
+                st.session_state["new_pred_cached"] = None
+                st.session_state["new_row_cached"] = None
+            else:
+                st.warning("Action non reconnue.")
+
+            st.caption(f"Fichier : {PENDING_PATH}")
+            try:
+                st.dataframe(pd.read_csv(PENDING_PATH, sep=sep, encoding="utf-8"), use_container_width=True)
+            except Exception as e:
+                st.error(f"Impossible de relire le fichier : {e}")
+
+    if c_reset.button("🔄 Réinitialiser la saisie"):
+        for k in list(DEFAULTS.keys()) + ["new_date", "new_row_cached", "new_pred_cached"]:
+            if k in DEFAULTS:
+                st.session_state[k] = DEFAULTS[k]
+            else:
+                st.session_state.pop(k, None)
+        if DRAFT_PATH.exists():
+            try:
+                DRAFT_PATH.unlink()
+            except Exception:
+                pass
+        st.rerun()
+
+# ======= Validation des résultats =======
+with tab_validate:
+    st.subheader("Valider les résultats et fusionner vers l'historique")
+    if not PENDING_PATH.exists():
+        st.info("Aucune course en attente. Ajoute d’abord une course depuis l’onglet “➕ Nouvelle course”.")
+    else:
+        pend = pd.read_csv(PENDING_PATH, sep=sep, encoding="utf-8")
+        if "race_id" not in pend.columns and all(k in pend.columns for k in rid_fields):
+            pend["race_id"] = make_race_id(pend)
+
+        st.write(f"Complète **{target_col}** (obligatoire) et **rapport** (facultatif, décimal avec point).")
+        edited = st.data_editor(pend, num_rows="dynamic", use_container_width=True, key="pending_editor")
+
+        if st.button("Valider et fusionner dans l'historique", type="primary"):
+            valid_mask = edited[target_col].notna() & (edited[target_col].astype(str).str.strip() != "")
+            done = edited[valid_mask].copy()
+            left = edited[~valid_mask].copy()
+
+            try:
+                hist = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+            except Exception:
+                hist = pd.DataFrame()
+            if "race_id" not in hist.columns and all(k in hist.columns for k in rid_fields):
+                hist["race_id"] = make_race_id(hist)
+
+            already = set(hist.get("race_id", pd.Series([], dtype=str)).astype(str))
+            to_add = done[~done["race_id"].astype(str).isin(already)].copy()
+
+            all_cols = list(dict.fromkeys(list(hist.columns) + list(to_add.columns)))
+            hist = hist.reindex(columns=all_cols)
+            to_add = to_add.reindex(columns=all_cols)
+
+            b1 = backup(COURSES_PATH); b2 = backup(PENDING_PATH)
+            updated_hist = pd.concat([hist, to_add], ignore_index=True)
+            updated_hist.to_csv(COURSES_PATH, index=False, sep=sep, encoding="utf-8")
+            left.to_csv(PENDING_PATH, index=False, sep=sep, encoding="utf-8")
+
+            st.success(f"✅ {len(to_add)} course(s) ajoutée(s) à l'historique. Backups : {b1.name} / {b2.name}")
+
+            colA, colB = st.columns(2)
+            if colA.button("🔄 Recharger données & métriques"):
+                _reload_all(); st.toast("Données/métriques rechargées.", icon="✅"); st.rerun()
+            if colB.button("🔁 Ré-entraîner le modèle maintenant"):
+                with st.spinner("Entraînement en cours..."):
+                    info = train_and_save(ROOT / "config.yaml")
+                _reload_all()
+                st.success(
+                    f"Modèle ré-entraîné • Hit@1={info['hit1']:.3f} • Hit@4={info['hit4']:.3f} • LogLoss={info['logloss']:.4f}"
+                )
+                st.rerun()

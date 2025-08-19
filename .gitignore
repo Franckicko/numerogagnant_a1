@@ -1,6 +1,40 @@
-﻿__pycache__/
+@"
+# Python
+__pycache__/
 *.pyc
-data/raw/
-data/processed/*.csv
-models/archive/
-models/*.bak
+*.pyo
+*.pyd
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / env
+.venv/
+.env
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
+.streamlit/secrets.toml
+
+# Data (générées / privées)
+data/processed/
+data/raw/pending_courses.csv
+data/raw/ui_draft.json
+data/raw/*backup_*.csv
+data/raw/new_course_draft.json
+
+# Prédictions générées
+data/processed/predictions_top4.csv
+
+# Modèles volumineux
+models/*.joblib
+models/best_metrics.json
+
+# Logs / archives
+*.log
+*.zip
+"@ | Set-Content .gitignore -Encoding UTF8
