@@ -1,5 +1,4 @@
 xgb_params:
-  n_estimators: 2000
   learning_rate: 0.03645714663913172
   max_depth: 5
   min_child_weight: 10
@@ -12,4 +11,5 @@ xgb_params:
   eval_metric: mlogloss
   tree_method: hist
   num_class: 18
+  num_boost_round: 2000
 temperature_T: 1.4377312734760093
