@@ -16,7 +16,8 @@ from src.train import train_and_save  # bouton de ré-entraînement
 # ---------- constantes ----------
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "xgb_multiclass.joblib"
-COURSES_PATH = ROOT / "data" / "raw" / "Courses_Completes_a1.csv"
+COURSES_PATH = ROOT / cfg["data"].get("courses_csv", "data/raw/Courses_Completes_a1.csv")
+SAMPLE_PATH  = ROOT / cfg["data"].get("sample_csv",  "ex_data/Courses_Completes_a1_sample.csv")
 PENDING_PATH = ROOT / "data" / "raw" / "pending_courses.csv"
 HIPPODROMES_PATH = ROOT / "data" / "raw" / "hippodrome.csv"
 DRAFT_PATH = ROOT / "data" / "raw" / "ui_draft.json"
@@ -186,11 +187,28 @@ def upsert_pending(save_row: dict) -> str:
 
 def _reload_all():
     """Relit CSV + modèle et recalcule features. Stocke en session."""
-    courses = pd.read_csv(COURSES_PATH, sep=sep, encoding="utf-8")
+    main_path = COURSES_PATH
+    sample_path = SAMPLE_PATH
+
+    use_path = main_path if main_path.exists() else sample_path
+    if not use_path.exists():
+        st.error(
+            "Fichier introuvable.\n\n"
+            "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni "
+            "`ex_data/Courses_Completes_a1_sample.csv` (exemple) ne sont présents."
+        )
+        st.stop()
+
+    if use_path != main_path:
+        st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
+
+    courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
+
     X, y, meta, _ = build_dataset(courses, cfg)
     st.session_state["__X__"] = X
     st.session_state["__y__"] = y
     st.session_state["__meta__"] = meta
+
     bundle = joblib.load(MODEL_PATH)
     st.session_state["__model__"] = bundle["model"]
     st.session_state["__le__"] = bundle["label_encoder"]
