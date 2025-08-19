@@ -1,27 +1,25 @@
-# numerogagnant_a1 (version légère, calquée sur a2/a4)
+# Numero Gagnant (multiclass)
 
-## Ce qui reste
-Place **exactement** ces deux fichiers dans `data/raw/` :
-- `Courses_Completes.csv`
-- `hippodrome.csv`
+Jeu de données: 1 ligne = 1 course. Cible `a1` = numéro gagnant. On prédit un **top 4** de numéros.
 
-*(Noms identiques à ceux que tu as déjà.)*
-
-## Sorties officielles (minimales)
-- `data/processed/predictions_top4.csv`
-- `data/processed/metrics_history.csv`
-- `models/xgb_multiclass.joblib` (champion)
-
-## Entraîner (champion/challenger, anti-régression logloss)
+## Installation
 ```bash
+py -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-python src/train.py
 ```
 
-## Prédire (ajoute/écrase la ligne du jour)
+## Entraînement
 ```bash
-python src/predict.py --date YYYY-MM-DD --hippodrome "Deauville" --numcourse C3 --partants 16 --distance 2000 --pronos 9,13,15,12,16,1,6,2
+python -m src.train
 ```
 
-- Promotion de modèle **uniquement si** `logloss_valid` **baisse** (epsilon configurable).
-- Pas de `.venv` ni de backups : projet **léger** et autonome comme a2/a4.
+## Prédictions fichier
+```bash
+python -m src.predict
+```
+
+## Interface Streamlit
+```bash
+streamlit run app.py
+```
