@@ -16,7 +16,8 @@ from src.train import train_and_save  # bouton de ré-entraînement
 # ---------- constantes ----------
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "xgb_multiclass.joblib"
-COURSES_PATH = ROOT / "data" / "raw" / "Courses_Completes_a1.csv"
+COURSES_PATH = ROOT / cfg["data"].get("courses_csv", "data/raw/Courses_Completes_a1.csv")
+SAMPLE_PATH  = ROOT / cfg["data"].get("sample_csv",  "ex_data/Courses_Completes_a1_sample.csv")
 PENDING_PATH = ROOT / "data" / "raw" / "pending_courses.csv"
 HIPPODROMES_PATH = ROOT / "data" / "raw" / "hippodrome.csv"
 DRAFT_PATH = ROOT / "data" / "raw" / "ui_draft.json"
@@ -203,7 +204,19 @@ def _reload_all():
     if use_path != main_path:
         st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
 
-    courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
+    use_path = COURSES_PATH if COURSES_PATH.exists() else SAMPLE_PATH
+if not use_path.exists():
+    st.error(
+        "Fichier introuvable.\n\n"
+        "Ni `data/raw/Courses_Completes_a1.csv` (privé) ni "
+        "`ex_data/Courses_Completes_a1_sample.csv` (exemple) ne sont présents."
+    )
+    st.stop()
+
+if use_path != COURSES_PATH:
+    st.warning("Fichier principal absent → utilisation du **jeu d'exemple**.")
+
+courses = pd.read_csv(use_path, sep=sep, encoding="utf-8")
     X, y, meta, _ = build_dataset(courses, cfg)
     st.session_state["__X__"] = X
     st.session_state["__y__"] = y

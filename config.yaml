@@ -1,7 +1,7 @@
 data:
+  csv_sep: ","
   courses_csv: data/raw/Courses_Completes_a1.csv
-  hippodromes_csv: data/raw/hippodrome.csv
-  csv_sep: ','
+  sample_csv: ex_data/Courses_Completes_a1_sample.csv
 columns:
   race_id_fields:
   - date
